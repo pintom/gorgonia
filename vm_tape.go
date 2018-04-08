@@ -76,7 +76,7 @@ func NewTapeMachine(g *ExprGraph, opts ...VMOpt) *tapeMachine {
 		setEngine(n.boundTo, m.Engine)
 	}
 	m.execState = makeExecState(m.p)
-
+	m.buf = new(bytes.Buffer)
 	runtime.SetFinalizer(m, finalizeTapeMachine) // a "defer" to deinitialize CUDA stuff (if using CUDA build)
 	return m
 }
@@ -118,6 +118,7 @@ func (m *tapeMachine) Reset() {
 	m.pc = 0
 	m.ExternMetadata.Reset()
 	m.resetExecState()
+	m.buf.Reset()
 }
 
 // Prog returns the compiled program. This would mainly be used in debugging functions
@@ -168,7 +169,7 @@ func (m *tapeMachine) Run(frag fragment) (err error) {
 	}()
 
 	for _, instr := range frag {
-		if err = instr.exec(m); err != nil {
+		if err = instr.exec(m, 0); err != nil {
 			return errors.Wrap(err, "Failed to carry exec()")
 		}
 	}
@@ -226,24 +227,26 @@ func (m *tapeMachine) RunAll() (err error) {
 }
 
 func (m *tapeMachine) runall(errChan chan error, doneChan chan struct{}) {
-	m.buf = new(bytes.Buffer)
-	m.initExecState()
+	logChan := make(chan tx, 1024)
+	m.initExecState(logChan)
 
 	var wg sync.WaitGroup
 	threads := runtime.NumCPU()
 	workers := make(chan struct{}, threads)
+	go m.execLogger(logChan)
 
 	for t := 0; t < threads; t++ {
 		workers <- struct{}{} // ensures that at any given time, there are actually THREADS available workers
 		wg.Add(1)
-		go m.execute(workers, errChan, &wg, t)
+		go m.execute(workers, errChan, logChan, &wg, t)
 	}
 	wg.Wait()
+	close(logChan)
 	// log.Println(m.buf.String())
 	doneChan <- struct{}{}
 }
 
-func (m *tapeMachine) execute(workers chan struct{}, errChan chan error, wg *sync.WaitGroup, id int) {
+func (m *tapeMachine) execute(workers chan struct{}, errChan chan error, logChan chan tx, wg *sync.WaitGroup, id int) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 execloop:
@@ -261,11 +264,18 @@ execloop:
 		}
 		instrs := m.p.m[pnode.Node]
 		for _, instr := range instrs {
+			logChan <- tx{
+				index:    pnode.index,
+				instr:    instr,
+				msg1:     "Doing",
+				threadID: id,
+			}
+
 			// m.Lock()
 			// fmt.Fprintf(m.buf, "Executing %d : %v | %v\n", pnode.index, pnode, instr)
 			// m.Unlock()
 
-			if err := m.executeOneInstr(instr); err != nil {
+			if err := m.executeOneInstr(instr, id); err != nil {
 				err = errors.Wrapf(err, "pnode %d: %v", pnode.index, pnode)
 				errChan <- err
 				m.execState.error()
@@ -279,8 +289,8 @@ execloop:
 	wg.Done()
 }
 
-func (m *tapeMachine) executeOneInstr(instr tapeInstr) error {
-	if err := instr.exec(m); err != nil {
+func (m *tapeMachine) executeOneInstr(instr tapeInstr, id int) error {
+	if err := instr.exec(m, id); err != nil {
 		return errors.Wrapf(err, "Failed to execute instruction %v", instr)
 	}
 
@@ -297,6 +307,12 @@ func (m *tapeMachine) executeOneInstr(instr tapeInstr) error {
 
 	}
 	return nil
+}
+
+func (m *tapeMachine) execLogger(ch <-chan tx) {
+	for t := range ch {
+		fmt.Fprintf(m.buf, "%v on %d. Node Index: %d. Instr: %v - %v\n", t.msg1, t.threadID, t.index, t.instr, t.msg2)
+	}
 }
 
 func (m *tapeMachine) getValue(r register) Value {
@@ -479,7 +495,7 @@ type tapeInstr interface {
 	ID() int64 // ID is the node ID
 	reads() []register
 	writes() register
-	exec(*tapeMachine) error
+	exec(m *tapeMachine, id int) error
 	fmt.Stringer
 }
 
@@ -524,8 +540,8 @@ func (instr alloc) ID() int64         { return instr.id }
 func (instr alloc) reads() []register { return instr.readFrom }
 func (instr alloc) writes() register  { return instr.writeTo }
 
-func (instr alloc) exec(m *tapeMachine) (err error) {
-	m.logf("Executing %v", instr)
+func (instr alloc) exec(m *tapeMachine, id int) (err error) {
+	m.logf("Executing %v on thread %d", instr, id)
 
 	var dt tensor.Dtype
 	if dt, err = dtypeOf(instr.t); err != nil {
@@ -564,8 +580,8 @@ type free struct {
 func (instr free) ID() int64         { return -1 }
 func (instr free) reads() []register { return []register{instr.readsFrom} }
 func (instr free) writes() register  { return register{-1, CPU} }
-func (instr free) exec(m *tapeMachine) error {
-	m.logf("Executing Free %v", instr.readsFrom)
+func (instr free) exec(m *tapeMachine, id int) error {
+	m.logf("Executing Free %v on thread %d", instr.readsFrom, id)
 	switch instr.readsFrom.device {
 	case CPU:
 		return nil
@@ -590,8 +606,8 @@ func (instr loadArg) ID() int64         { return instr.index }
 func (instr loadArg) reads() []register { return nil }
 func (instr loadArg) writes() register  { return instr.writeTo }
 
-func (instr loadArg) exec(m *tapeMachine) error {
-	m.logf("Executing %v", instr)
+func (instr loadArg) exec(m *tapeMachine, id int) error {
+	m.logf("Executing %v on thread %d", instr, id)
 	m.enterLogScope()
 	defer m.leaveLogScope()
 
@@ -652,8 +668,8 @@ func newExecOp(n *Node) *execOp {
 	}
 }
 
-func (instr *execOp) exec(m *tapeMachine) error {
-	m.logf("Executing %v. Node is: %x", instr, instr.id)
+func (instr *execOp) exec(m *tapeMachine, id int) error {
+	m.logf("Executing %v on thread %d. Node is: %x", instr, id, instr.id)
 	m.enterLogScope()
 	defer m.leaveLogScope()
 
@@ -663,12 +679,19 @@ func (instr *execOp) exec(m *tapeMachine) error {
 	inputs := make([]Value, 0, len(instr.readFrom))
 	for _, reg := range instr.readFrom {
 		v := m.getValue(reg)
+		m.execState.logChan <- tx{
+			instr:    instr,
+			index:    m.execState.m[m.p.g.Node(instr.id).(*Node)],
+			msg1:     fmt.Sprintf("Get Reg %v", reg),
+			msg2:     fmt.Sprintf("Shape %v", v.Shape()),
+			threadID: id,
+		}
 		inputs = append(inputs, v)
 		m.watchedInstrLogf(instr, m.valueFmt, v)
 	}
 	m.leaveLogScope()
 
-	err := instr.execKernel(m, inputs)
+	err := instr.execKernel(m, id, inputs)
 	return err
 }
 
@@ -679,7 +702,7 @@ func (instr *execOp) String() string {
 // flushInstr is for blastoise and cubone
 type flushInstr struct{}
 
-func (instr flushInstr) exec(m *tapeMachine) error {
+func (instr flushInstr) exec(m *tapeMachine, id int) error {
 	if m.WorkAvailable() == nil {
 		return nil
 	}
@@ -697,10 +720,10 @@ type letInstr struct {
 	writeTo  register
 }
 
-func (instr letInstr) ID() int64               { return -1 }
-func (instr letInstr) reads() []register       { return []register{instr.readFrom} }
-func (instr letInstr) writes() register        { return instr.writeTo }
-func (instr letInstr) exec(*tapeMachine) error { return nil }
+func (instr letInstr) ID() int64                         { return -1 }
+func (instr letInstr) reads() []register                 { return []register{instr.readFrom} }
+func (instr letInstr) writes() register                  { return instr.writeTo }
+func (instr letInstr) exec(m *tapeMachine, id int) error { return nil }
 
 func (instr letInstr) String() string {
 	return fmt.Sprintf("LET %v = %v", instr.writeTo, instr.readFrom)
@@ -718,8 +741,8 @@ type readInstr struct {
 func (instr *readInstr) ID() int64         { return -1 }
 func (instr *readInstr) reads() []register { return []register{instr.readFrom} }
 func (instr *readInstr) writes() register  { return register{-1, CPU} }
-func (instr *readInstr) exec(m *tapeMachine) (err error) {
-	m.logf("Executing READ - read from %v into %v", instr.readFrom, instr.into)
+func (instr *readInstr) exec(m *tapeMachine, id int) (err error) {
+	m.logf("Executing READ on thread %d- read from %v into %v", id, instr.readFrom, instr.into)
 	v := m.getValue(instr.readFrom)
 	if v == nil {
 		return nyi("value of nil", "readInstr.exec")
@@ -764,9 +787,11 @@ type execState struct {
 	done    bool
 	err     bool
 
-	buf *bytes.Buffer
+	logChan chan tx // channel for logging when "inflight"
+	buf     *bytes.Buffer
 }
 
+// makeExecState takes a program, does some cursory analysis to build an execution "graph" of sorts
 func makeExecState(p *program) execState {
 	s := make([]priorityNode, len(p.sorted))
 	m := make(map[*Node]int, len(p.sorted))
@@ -831,20 +856,19 @@ func makeExecState(p *program) execState {
 		writes[k] = set.Ints(v)
 	}
 
+	// extend the "tos" and "froms"
 	for reg, wnids := range writes {
 		if reg.id == -1 {
 			continue
 		}
-		// log.Printf("nodes that write %v | %v", reg, wnids)
 		for _, nid := range wnids {
 			rnids := reads[reg]
 			for _, rid := range rnids {
 				if rid >= nid {
 					continue
 				}
-				// log.Printf("\t%d reads %v: %v | %v", nid, reg, rid, t[rid])
+				s[nid]._p++ // keep track of the original priority
 				s[nid].priority++
-				s[nid]._p++
 				f[nid] = append(f[nid], rid)
 				t[rid] = append(t[rid], nid)
 			}
@@ -864,10 +888,27 @@ func makeExecState(p *program) execState {
 	}
 }
 
-func (m *tapeMachine) initExecState() {
+func (m *tapeMachine) initExecState(logChan chan tx) {
 	m.execState.q2 = nil                                     // gc previous
 	m.execState.q2 = make(chan int, len(m.execState.sorted)) // make new one
 	m.execState.buf = m.buf
+	m.logChan = logChan
+
+	// loggging for failure
+	fmt.Fprintf(m.buf, "%v\n", m.p)
+	fmt.Fprintf(m.buf, "Priorities: \n")
+	for i, s := range m.execState.sorted {
+		fmt.Fprintf(m.buf, "\t%d: %d\n", i, s._p)
+	}
+	fmt.Fprintf(m.buf, "To:\n")
+	for i, v := range m.execState.t {
+		fmt.Fprintf(m.buf, "\t%d: %v\n", i, v)
+	}
+	fmt.Fprintf(m.buf, "From:\n")
+	for i, v := range m.execState.f {
+		fmt.Fprintf(m.buf, "\t%d: %v\n", i, v)
+	}
+
 	for _, leaf := range m.p.g.leaves {
 		m.execState.q2 <- m.execState.m[leaf]
 	}
@@ -890,6 +931,11 @@ func (m *tapeMachine) resetExecState() {
 }
 
 func (s *execState) finish(node *priorityNode) {
+	s.logChan <- tx{
+		index: node.index,
+		msg1:  "Finishing",
+	}
+
 	to := s.t[node.index]
 	for _, i := range to {
 		n := &s.sorted[i]
@@ -964,3 +1010,12 @@ const (
 	executed  int32 = -1
 	executing int32 = 1
 )
+
+// tx is a transaction log essentially
+type tx struct {
+	index int // node index
+	instr tapeInstr
+
+	threadID   int
+	msg1, msg2 string
+}

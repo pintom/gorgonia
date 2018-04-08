@@ -2,7 +2,11 @@
 
 package gorgonia
 
-import "github.com/pkg/errors"
+import (
+	"fmt"
+
+	"github.com/pkg/errors"
+)
 
 func finalizeTapeMachine(m *tapeMachine) {}
 
@@ -11,7 +15,7 @@ func UseCudaFor(ops ...string) VMOpt {
 	return func(m VM) {}
 }
 
-func (instr *execOp) execKernel(m *tapeMachine, inputs []Value) (err error) {
+func (instr *execOp) execKernel(m *tapeMachine, threadID int, inputs []Value) (err error) {
 	// Execute
 	var v Value
 	switch {
@@ -66,14 +70,27 @@ func (instr *execOp) execKernel(m *tapeMachine, inputs []Value) (err error) {
 
 	// this is a gradient node then, we should also bind the value to the node's dualValue
 	if m.bindDV() && node.derivOf != nil {
+		m.execState.logChan <- tx{
+			msg2: fmt.Sprintf("len(deriveOf): %d", len(node.derivOf)),
+		}
 		for _, src := range node.derivOf {
 			if len(m.bindNodesDV) > 0 && !m.bindNodesDV.Contains(src) {
 				continue
 			}
-
 			if src.boundTo != nil {
+				xxx, ok := src.boundTo.(*dualValue)
 				dv := dvUnit(src.boundTo)
+				if !dv.d.Shape().Eq(dv.Value.Shape()) {
+					panic(fmt.Sprintf("W???!!! d: %v, v %v ", dv.d.Shape(), dv.Value.Shape()))
+				}
 				add := newEBOByType(addOpType, TypeOf(dv.d), TypeOf(v))
+				m.execState.logChan <- tx{
+					index:    m.execState.m[node],
+					msg1:     "\t\tDoing BindDV.",
+					msg2:     fmt.Sprintf("src: %v dv.d: %v V: %v | dv.d ptr: %v | v.ptr: %v | %v, %v", src, dv.d.Shape(), v.Shape(), dv.d.Pointer(), v.Pointer(), xxx, ok),
+					threadID: threadID,
+				}
+
 				if d, err := add.UnsafeDo(dv.d, v); err == nil {
 					dv.SetDeriv(d)
 					src.bind(dv)
@@ -92,6 +109,6 @@ func (instr *execOp) execKernel(m *tapeMachine, inputs []Value) (err error) {
 	return nil
 }
 
-func (instr deviceTransport) exec(m *tapeMachine) error {
+func (instr deviceTransport) exec(m *tapeMachine, id int) error {
 	return nil
 }

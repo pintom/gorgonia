@@ -123,6 +123,9 @@ func constantDV(val Value) *dualValue {
 	if retVal.d, err = CloneValue(val); err != nil {
 		panic(err)
 	}
+	if !retVal.d.Shape().Eq(retVal.Value.Shape()) {
+		panic(fmt.Sprintf("WTF %v != %v", retVal.Value.Shape(), retVal.d.Shape()))
+	}
 
 	retVal.d = ZeroValue(retVal.d)
 	return retVal

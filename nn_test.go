@@ -39,6 +39,7 @@ func dropoutTest(t *testing.T, dt tensor.Dtype) error {
 		t.Logf("Execution Log\n%v", m.buf.String())
 		return err
 	}
+	t.Logf("Execution Log\n%v", m.buf.String())
 	return nil
 }
 

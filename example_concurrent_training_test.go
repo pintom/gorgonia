@@ -1,5 +1,3 @@
-// +build concurrentTraining
-
 package gorgonia_test
 
 import (
@@ -56,8 +54,8 @@ func newConcurrentTrainer() *concurrentTrainer {
 }
 
 type cost struct {
-	Nodes
-	VM // placed for debugging purposes. In real life use you can just use a channel of Nodes
+	Nodes []*Node
+	VM    // placed for debugging purposes. In real life use you can just use a channel of Nodes
 
 	// cost Value
 }
@@ -70,7 +68,7 @@ func (t *concurrentTrainer) train(x, y Value, costChan chan cost, wg *sync.WaitG
 	}
 
 	costChan <- cost{
-		Nodes{t.x, t.y},
+		[]*Node{t.x, t.y},
 		t.vm,
 		// t.cost,
 	}
